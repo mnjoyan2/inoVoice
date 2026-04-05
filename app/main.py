@@ -1,18 +1,28 @@
+import io
 import logging
 import os
+import re
 import tempfile
+import threading
+import time
+import uuid
+import zipfile
+from typing import Optional
 
 import numpy as np
 import sherpa_onnx
 import soundfile as sf
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from pydantic import BaseModel
+from pydub import AudioSegment
 from starlette.background import BackgroundTask
 
 from omnivoice.cli.infer import get_best_device
 from omnivoice.models.omnivoice import OmniVoice, OmniVoiceGenerationConfig
+from omnivoice.utils.lang_map import LANG_NAME_TO_ID
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,6 +36,7 @@ STT_NUM_THREADS = int(os.environ.get("OMNILINGUAL_ASR_THREADS", "4"))
 STT_PROVIDER = os.environ.get("OMNILINGUAL_ASR_PROVIDER", "cpu")
 
 VOICES_DIR = os.environ.get("VOICES_DIR", "/workspace/voices")
+CUSTOM_VOICES_DIR = os.environ.get("CUSTOM_VOICES_DIR", "/workspace/voices/custom")
 
 VOICES = {
     "angry_marcus": {"emotion": "angry", "gender": "male", "pitch": "low", "age": "young adult"},
@@ -59,6 +70,12 @@ VOICES = {
     "neutral_kate": {"emotion": "neutral", "gender": "female", "pitch": "moderate", "age": "young adult"},
     "neutral_david": {"emotion": "neutral", "gender": "male", "pitch": "moderate", "age": "middle-aged"},
 }
+
+CUSTOM_VOICES: dict[str, dict] = {}
+
+JOB_TTL_SECONDS = 600
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
 
 _recognizer = None
 _tts_model = None
@@ -125,7 +142,135 @@ def _cleanup_task(*paths):
     return BackgroundTask(_clean)
 
 
-app = FastAPI(title="Speech API", version="0.1.0")
+def _all_voices() -> dict[str, dict]:
+    merged = {}
+    for name, meta in VOICES.items():
+        merged[name] = {**meta, "custom": False}
+    for name, meta in CUSTOM_VOICES.items():
+        merged[name] = {**meta, "custom": True}
+    return merged
+
+
+def _resolve_voice_path(voice_name: str) -> str:
+    if voice_name in VOICES:
+        return os.path.join(VOICES_DIR, f"{voice_name}.wav")
+    if voice_name in CUSTOM_VOICES:
+        return os.path.join(CUSTOM_VOICES_DIR, f"{voice_name}.wav")
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unknown voice '{voice_name}'. Use GET /api/voices to list available voices.",
+    )
+
+
+def _is_library_path(path: str | None) -> bool:
+    if not path:
+        return False
+    return path.startswith(VOICES_DIR) or path.startswith(CUSTOM_VOICES_DIR)
+
+
+def _generate_audio(
+    text: str,
+    voice: str | None = None,
+    language: str | None = None,
+    instruct: str | None = None,
+    ref_text: str | None = None,
+    ref_audio_path: str | None = None,
+    num_step: int = 32,
+    guidance_scale: float = 2.0,
+    t_shift: float = 0.1,
+    denoise: bool = True,
+    speed: float = 1.0,
+    duration: float | None = None,
+    preprocess_prompt: bool = True,
+    postprocess_output: bool = True,
+    layer_penalty_factor: float = 5.0,
+    position_temperature: float = 5.0,
+    class_temperature: float = 0.0,
+    audio_chunk_duration: float = 15.0,
+    audio_chunk_threshold: float = 30.0,
+) -> tuple[np.ndarray, int]:
+    model = get_tts()
+
+    ref_path = ref_audio_path
+    if not ref_path and voice and voice.strip():
+        vp = _resolve_voice_path(voice.strip())
+        if not os.path.isfile(vp):
+            raise HTTPException(status_code=500, detail=f"Voice file for '{voice}' is missing on disk")
+        ref_path = vp
+
+    gen_config = OmniVoiceGenerationConfig(
+        num_step=num_step,
+        guidance_scale=guidance_scale,
+        t_shift=t_shift,
+        denoise=denoise,
+        preprocess_prompt=preprocess_prompt,
+        postprocess_output=postprocess_output,
+        layer_penalty_factor=layer_penalty_factor,
+        position_temperature=position_temperature,
+        class_temperature=class_temperature,
+        audio_chunk_duration=audio_chunk_duration,
+        audio_chunk_threshold=audio_chunk_threshold,
+    )
+
+    kw: dict = {
+        "text": text.strip(),
+        "language": _resolve_language(language),
+        "generation_config": gen_config,
+    }
+
+    if ref_path is not None:
+        kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
+            ref_audio=ref_path,
+            ref_text=ref_text or None,
+            preprocess_prompt=gen_config.preprocess_prompt,
+        )
+    elif instruct and instruct.strip():
+        kw["instruct"] = instruct.strip()
+
+    if speed is not None and float(speed) != 1.0:
+        kw["speed"] = float(speed)
+    if duration is not None and float(duration) > 0:
+        kw["duration"] = float(duration)
+
+    audios = model.generate(**kw)
+    waveform = audios[0].squeeze(0).cpu().numpy()
+    waveform_int16 = (np.clip(waveform, -1.0, 1.0) * 32767).astype(np.int16)
+    return waveform_int16, model.sampling_rate
+
+
+def _save_wav(waveform: np.ndarray, sr: int) -> str:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    sf.write(tmp.name, waveform, sr, format="WAV", subtype="PCM_16")
+    return tmp.name
+
+
+def _wav_to_mp3(wav_path: str) -> str:
+    mp3_path = wav_path.rsplit(".", 1)[0] + ".mp3"
+    audio = AudioSegment.from_wav(wav_path)
+    audio.export(mp3_path, format="mp3", bitrate="192k")
+    return mp3_path
+
+
+def _purge_expired_jobs():
+    now = time.time()
+    expired = [jid for jid, j in _jobs.items() if now - j["created_at"] > JOB_TTL_SECONDS]
+    for jid in expired:
+        j = _jobs.pop(jid, None)
+        if j and j.get("file") and os.path.exists(j["file"]):
+            os.unlink(j["file"])
+
+
+def _load_custom_voices():
+    os.makedirs(CUSTOM_VOICES_DIR, exist_ok=True)
+    for fname in os.listdir(CUSTOM_VOICES_DIR):
+        if not fname.endswith(".wav"):
+            continue
+        name = fname[:-4]
+        if name not in VOICES:
+            CUSTOM_VOICES[name] = {"emotion": "custom", "gender": "unknown"}
+
+
+app = FastAPI(title="Speech API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
@@ -140,28 +285,100 @@ def health():
     return {"status": "ok", "stt_model_dir": STT_MODEL_DIR, "tts_model": TTS_MODEL_ID}
 
 
+@app.get("/api/languages")
+def list_languages():
+    return {
+        "languages": [
+            {"name": name, "code": code}
+            for name, code in sorted(LANG_NAME_TO_ID.items())
+        ]
+    }
+
+
 @app.get("/api/voices")
 def list_voices():
+    all_v = _all_voices()
     return {
         "voices": [
             {"name": name, **meta}
-            for name, meta in VOICES.items()
+            for name, meta in all_v.items()
         ]
     }
 
 
 @app.get("/api/voices/{name}/sample")
 def voice_sample(name: str):
-    if name not in VOICES:
+    if name in VOICES:
+        path = os.path.join(VOICES_DIR, f"{name}.wav")
+    elif name in CUSTOM_VOICES:
+        path = os.path.join(CUSTOM_VOICES_DIR, f"{name}.wav")
+    else:
         raise HTTPException(status_code=404, detail=f"Voice '{name}' not found")
-    path = os.path.join(VOICES_DIR, f"{name}.wav")
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail=f"Sample file for '{name}' not found")
     return FileResponse(path, media_type="audio/wav", filename=f"{name}.wav")
 
 
+@app.post("/api/voices/clone")
+async def clone_voice(
+    name: str = Form(...),
+    ref_audio: UploadFile = File(...),
+    ref_text: str | None = Form(None),
+    gender: str | None = Form(None),
+    emotion: str | None = Form(None),
+):
+    name = name.strip()
+    if not re.match(r"^[a-z0-9_]+$", name):
+        raise HTTPException(status_code=400, detail="Name must be lowercase alphanumeric with underscores only")
+    if name in VOICES:
+        raise HTTPException(status_code=409, detail=f"'{name}' conflicts with a built-in voice")
+    if name in CUSTOM_VOICES:
+        raise HTTPException(status_code=409, detail=f"'{name}' already exists. Delete it first.")
+
+    os.makedirs(CUSTOM_VOICES_DIR, exist_ok=True)
+    rsfx = os.path.splitext(ref_audio.filename or "")[1] or ".wav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=rsfx) as f:
+        f.write(await ref_audio.read())
+        tmp_path = f.name
+
+    try:
+        samples, sr = sf.read(tmp_path, dtype="float32")
+        if samples.ndim > 1:
+            samples = samples[:, 0]
+        dest = os.path.join(CUSTOM_VOICES_DIR, f"{name}.wav")
+        sf.write(dest, samples, sr, format="WAV", subtype="PCM_16")
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    meta = {
+        "emotion": emotion or "custom",
+        "gender": gender or "unknown",
+    }
+    CUSTOM_VOICES[name] = meta
+    logger.info("Custom voice cloned: %s", name)
+    return {"name": name, **meta, "custom": True}
+
+
+@app.delete("/api/voices/{name}")
+def delete_voice(name: str):
+    if name in VOICES:
+        raise HTTPException(status_code=403, detail="Cannot delete built-in voices")
+    if name not in CUSTOM_VOICES:
+        raise HTTPException(status_code=404, detail=f"Custom voice '{name}' not found")
+    path = os.path.join(CUSTOM_VOICES_DIR, f"{name}.wav")
+    if os.path.exists(path):
+        os.unlink(path)
+    CUSTOM_VOICES.pop(name, None)
+    logger.info("Custom voice deleted: %s", name)
+    return {"deleted": name}
+
+
 @app.post("/api/stt")
-async def transcribe(audio: UploadFile = File(...)):
+async def transcribe(
+    audio: UploadFile = File(...),
+    language: str | None = Form(None),
+):
     data = await audio.read()
     suffix = os.path.splitext(audio.filename or "")[1] or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
@@ -174,6 +391,8 @@ async def transcribe(audio: UploadFile = File(...)):
         stream.accept_waveform(sample_rate=sample_rate, waveform=samples)
         recognizer.decode_stream(stream)
         text = stream.result.text.strip()
+        if language:
+            logger.info("STT language hint: %s (informational only)", language)
         return {"text": text}
     finally:
         os.unlink(path)
@@ -187,6 +406,7 @@ async def synthesize(
     instruct: str | None = Form(None),
     ref_text: str | None = Form(None),
     ref_audio: UploadFile | None = File(None),
+    format: str = Form("wav"),
     num_step: int = Form(32),
     guidance_scale: float = Form(2.0),
     t_shift: float = Form(0.1),
@@ -201,7 +421,9 @@ async def synthesize(
     audio_chunk_duration: float = Form(15.0),
     audio_chunk_threshold: float = Form(30.0),
 ):
-    model = get_tts()
+    if format not in ("wav", "mp3"):
+        raise HTTPException(status_code=400, detail="format must be 'wav' or 'mp3'")
+
     ref_path = None
     try:
         if ref_audio is not None:
@@ -209,94 +431,232 @@ async def synthesize(
             with tempfile.NamedTemporaryFile(delete=False, suffix=rsfx) as f:
                 f.write(await ref_audio.read())
                 ref_path = f.name
-        elif voice and voice.strip():
-            voice_name = voice.strip()
-            if voice_name not in VOICES:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unknown voice '{voice_name}'. Use GET /api/voices to list available voices.",
-                )
-            voice_path = os.path.join(VOICES_DIR, f"{voice_name}.wav")
-            if not os.path.isfile(voice_path):
-                raise HTTPException(status_code=500, detail=f"Voice file for '{voice_name}' is missing on disk")
-            ref_path = voice_path
 
-        gen_config = OmniVoiceGenerationConfig(
-            num_step=int(num_step or 32),
-            guidance_scale=float(guidance_scale)
-            if guidance_scale is not None
-            else 2.0,
-            t_shift=float(t_shift),
-            denoise=bool(denoise) if denoise is not None else True,
-            preprocess_prompt=bool(preprocess_prompt),
-            postprocess_output=bool(postprocess_output),
-            layer_penalty_factor=float(layer_penalty_factor),
-            position_temperature=float(position_temperature),
-            class_temperature=float(class_temperature),
-            audio_chunk_duration=float(audio_chunk_duration),
-            audio_chunk_threshold=float(audio_chunk_threshold),
+        logger.info(
+            "TTS request: text_len=%d, language=%s, voice=%s, format=%s",
+            len(text), language, voice, format,
         )
 
-        kw: dict = {
-            "text": text.strip(),
-            "language": _resolve_language(language),
-            "generation_config": gen_config,
-        }
+        waveform, sr = _generate_audio(
+            text=text,
+            voice=voice,
+            language=language,
+            instruct=instruct,
+            ref_text=ref_text,
+            ref_audio_path=ref_path,
+            num_step=num_step,
+            guidance_scale=guidance_scale,
+            t_shift=t_shift,
+            denoise=denoise,
+            speed=speed,
+            duration=duration,
+            preprocess_prompt=preprocess_prompt,
+            postprocess_output=postprocess_output,
+            layer_penalty_factor=layer_penalty_factor,
+            position_temperature=position_temperature,
+            class_temperature=class_temperature,
+            audio_chunk_duration=audio_chunk_duration,
+            audio_chunk_threshold=audio_chunk_threshold,
+        )
 
-        if ref_path is not None:
-            kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
-                ref_audio=ref_path,
-                ref_text=ref_text or None,
-                preprocess_prompt=gen_config.preprocess_prompt,
+        wav_path = _save_wav(waveform, sr)
+        cleanup = [wav_path]
+
+        if format == "mp3":
+            mp3_path = _wav_to_mp3(wav_path)
+            cleanup.append(mp3_path)
+            if ref_path and not _is_library_path(ref_path):
+                cleanup.append(ref_path)
+            logger.info("TTS done: duration=%.1fs, format=mp3", len(waveform) / sr)
+            return FileResponse(
+                mp3_path,
+                media_type="audio/mpeg",
+                filename="output.mp3",
+                background=_cleanup_task(*cleanup),
             )
-        elif instruct and instruct.strip():
-            kw["instruct"] = instruct.strip()
 
-        if speed is not None and float(speed) != 1.0:
-            kw["speed"] = float(speed)
-        if duration is not None and float(duration) > 0:
-            kw["duration"] = float(duration)
-
-        logger.info(
-            "TTS request: text_len=%d, language=%s, voice=%s, ref=%s",
-            len(text),
-            kw.get("language"),
-            voice,
-            ref_path is not None,
-        )
-
-        audios = model.generate(**kw)
-
-        waveform = audios[0].squeeze(0).cpu().numpy()
-        waveform_int16 = (np.clip(waveform, -1.0, 1.0) * 32767).astype(np.int16)
-
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        sf.write(tmp.name, waveform_int16, model.sampling_rate, format="WAV", subtype="PCM_16")
-
-        logger.info(
-            "TTS done: duration=%.1fs",
-            len(waveform_int16) / model.sampling_rate,
-        )
-
-        is_voice_lib = ref_path and ref_path.startswith(VOICES_DIR)
-        cleanup_paths = [tmp.name] if is_voice_lib else [tmp.name, ref_path]
-
+        if ref_path and not _is_library_path(ref_path):
+            cleanup.append(ref_path)
+        logger.info("TTS done: duration=%.1fs, format=wav", len(waveform) / sr)
         return FileResponse(
-            tmp.name,
+            wav_path,
             media_type="audio/wav",
             filename="output.wav",
-            background=_cleanup_task(*cleanup_paths),
+            background=_cleanup_task(*cleanup),
         )
     except HTTPException:
         raise
     except Exception:
-        if ref_path and not ref_path.startswith(VOICES_DIR) and os.path.exists(ref_path):
+        if ref_path and not _is_library_path(ref_path) and os.path.exists(ref_path):
             os.unlink(ref_path)
         raise
 
 
+class BatchItem(BaseModel):
+    text: str
+    voice: Optional[str] = None
+    language: Optional[str] = None
+    instruct: Optional[str] = None
+    ref_text: Optional[str] = None
+
+
+class BatchRequest(BaseModel):
+    items: list[BatchItem]
+    format: str = "wav"
+    num_step: int = 32
+    guidance_scale: float = 2.0
+    speed: float = 1.0
+
+
+@app.post("/api/tts/batch")
+async def synthesize_batch(req: BatchRequest):
+    if not req.items:
+        raise HTTPException(status_code=400, detail="items list is empty")
+    if len(req.items) > 50:
+        raise HTTPException(status_code=400, detail="Maximum 50 items per batch")
+    if req.format not in ("wav", "mp3"):
+        raise HTTPException(status_code=400, detail="format must be 'wav' or 'mp3'")
+
+    buf = io.BytesIO()
+    cleanup = []
+    try:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, item in enumerate(req.items):
+                waveform, sr = _generate_audio(
+                    text=item.text,
+                    voice=item.voice,
+                    language=item.language,
+                    instruct=item.instruct,
+                    ref_text=item.ref_text,
+                    num_step=req.num_step,
+                    guidance_scale=req.guidance_scale,
+                    speed=req.speed,
+                )
+                wav_path = _save_wav(waveform, sr)
+                cleanup.append(wav_path)
+
+                if req.format == "mp3":
+                    mp3_path = _wav_to_mp3(wav_path)
+                    cleanup.append(mp3_path)
+                    zf.write(mp3_path, f"{i:03d}.mp3")
+                else:
+                    zf.write(wav_path, f"{i:03d}.wav")
+
+        logger.info("Batch TTS done: %d items", len(req.items))
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": "attachment; filename=batch.zip"},
+        )
+    finally:
+        for p in cleanup:
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+@app.post("/api/tts/async")
+async def synthesize_async(
+    text: str = Form(...),
+    voice: str | None = Form(None),
+    language: str | None = Form(None),
+    instruct: str | None = Form(None),
+    ref_text: str | None = Form(None),
+    ref_audio: UploadFile | None = File(None),
+    format: str = Form("wav"),
+    num_step: int = Form(32),
+    guidance_scale: float = Form(2.0),
+    t_shift: float = Form(0.1),
+    denoise: bool = Form(True),
+    speed: float = Form(1.0),
+    duration: float | None = Form(None),
+    preprocess_prompt: bool = Form(True),
+    postprocess_output: bool = Form(True),
+):
+    if format not in ("wav", "mp3"):
+        raise HTTPException(status_code=400, detail="format must be 'wav' or 'mp3'")
+
+    ref_path = None
+    if ref_audio is not None:
+        rsfx = os.path.splitext(ref_audio.filename or "")[1] or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=rsfx) as f:
+            f.write(await ref_audio.read())
+            ref_path = f.name
+
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _purge_expired_jobs()
+        _jobs[job_id] = {"status": "pending", "created_at": time.time(), "file": None, "error": None}
+
+    params = dict(
+        text=text, voice=voice, language=language, instruct=instruct,
+        ref_text=ref_text, ref_audio_path=ref_path,
+        num_step=num_step, guidance_scale=guidance_scale, t_shift=t_shift,
+        denoise=denoise, speed=speed, duration=duration,
+        preprocess_prompt=preprocess_prompt, postprocess_output=postprocess_output,
+    )
+
+    def _run():
+        try:
+            with _jobs_lock:
+                _jobs[job_id]["status"] = "processing"
+            waveform, sr = _generate_audio(**params)
+            wav_path = _save_wav(waveform, sr)
+            out_path = wav_path
+            if format == "mp3":
+                out_path = _wav_to_mp3(wav_path)
+                os.unlink(wav_path)
+            with _jobs_lock:
+                _jobs[job_id]["status"] = "done"
+                _jobs[job_id]["file"] = out_path
+        except Exception as e:
+            logger.exception("Async job %s failed", job_id)
+            with _jobs_lock:
+                _jobs[job_id]["status"] = "failed"
+                _jobs[job_id]["error"] = str(e)
+        finally:
+            if ref_path and not _is_library_path(ref_path) and os.path.exists(ref_path):
+                os.unlink(ref_path)
+
+    threading.Thread(target=_run, daemon=True).start()
+    logger.info("Async job created: %s", job_id)
+    return {"job_id": job_id, "status": "pending"}
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str, request: Request):
+    with _jobs_lock:
+        _purge_expired_jobs()
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    result = {"job_id": job_id, "status": job["status"]}
+    if job["status"] == "done":
+        result["download_url"] = str(request.url_for("job_download", job_id=job_id))
+    if job["status"] == "failed":
+        result["error"] = job["error"]
+    return result
+
+
+@app.get("/api/jobs/{job_id}/download")
+def job_download(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
+    if job["status"] != "done":
+        raise HTTPException(status_code=409, detail=f"Job is {job['status']}, not ready for download")
+    path = job["file"]
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=410, detail="Output file has been cleaned up")
+    ext = os.path.splitext(path)[1]
+    media = "audio/mpeg" if ext == ".mp3" else "audio/wav"
+    return FileResponse(path, media_type=media, filename=f"output{ext}")
+
+
 @app.on_event("startup")
 def startup():
+    _load_custom_voices()
     if os.environ.get("PRELOAD_STT", "").lower() in ("1", "true", "yes"):
         get_recognizer()
     if os.environ.get("PRELOAD_TTS", "").lower() in ("1", "true", "yes"):
